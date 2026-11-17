@@ -7,13 +7,15 @@ import mediapipe as mp
 
 from deepface import DeepFace
 from concurrent.futures import ThreadPoolExecutor
+from recognition_policy import match_identity, MultiFaceTracker
+from facevision_config import DATASET
 
-DATABASE = "dataset"
+DATABASE = str(DATASET)
 MODEL = "Facenet"
-LIMIT = 0.36
-INTERVAL = 0.7
+LIMIT = 0.36  # Starting point; calibrate with genuine and unknown people.
+INTERVAL = 0.15
 
-# Зургийн векторуудыг санах
+# Zurgiin vektoruudiig sanah
 known_faces = {}
 
 def get_embedding(image):
@@ -34,9 +36,9 @@ def get_embedding(image):
     return vector / length
 
 
-print("Бүртгэлтэй хүмүүсийн мэдээллийг ачаалж байна...")
+print("burtgeltei humuusiin medeelliig achaalj bn...")
 
-# Зургуудыг зөвхөн эхлэх үед боловсруулна
+# zurguudiig zovhn ehleh uyd bolovsruulns
 if os.path.isdir(DATABASE):
     for name in os.listdir(DATABASE):
         folder = os.path.join(DATABASE, name)
@@ -59,44 +61,34 @@ if os.path.isdir(DATABASE):
                     vectors.append(vector)
 
             except Exception as e:
-                print("Зураг уншихад алдаа:", path, e)
+                print("Zurag unshihad aldaa:", path, e)
 
         if vectors:
             known_faces[name] = np.stack(vectors)
             print(f"{name}: {len(vectors)} зураг")
 
-print("Бүртгэлтэй хүмүүс:", list(known_faces.keys()))
+print("burtgeltei humuus:", list(known_faces.keys()))
 
-# Нүүр таних функц
+# Nuur tanih punkts
 def recognize_face(face_image):
+    if min(face_image.shape[:2]) < 90:
+        return "Unknown"
+    gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
+    if cv2.Laplacian(gray, cv2.CV_64F).var() < 35:
+        return "Unknown"
     try:
         vector = get_embedding(face_image)
     except Exception as e:
-        print("Таних алдаа:", e)
+        print("tanih aldaa:", e)
         return "Unknown"
 
     if vector is None:
         return "Unknown"
 
-    best_name = "Unknown"
-    best_score = float("inf")
-
-    for name, vectors in known_faces.items():
-        # Cosine distance
-        distances = 1 - (vectors @ vector)
-        distances = np.sort(distances)
-
-        count = min(3, len(distances))
-        score = float(np.mean(distances[:count]))
-
-        if score < LIMIT and score < best_score:
-            best_score = score
-            best_name = name
-
-    return best_name
+    return match_identity(vector, known_faces, threshold=LIMIT)
 
 
-# Нэг зураг доторх бүх нүүрийг таних
+# Neg zurag dotorh buh huniig tanih
 def recognize_all(face_items):
     answers = []
 
@@ -115,55 +107,30 @@ detector = mp.solutions.face_detection.FaceDetection(
 cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
 
 if not cap.isOpened():
-    print("Камер нээгдсэнгүй!")
+    print("camera neegdh!")
     detector.close()
     raise SystemExit
 
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-# Таних ажиллагааг тусдаа thread дээр хийнэ
+# tanih ajilggaag tusdaa thread deer hiine
 executor = ThreadPoolExecutor(max_workers=1)
 future = None
 
-last_results = []
 last_check = 0
-
-def box_center(box):
-    x1, y1, x2, y2 = box
-    return ((x1 + x2) / 2, (y1 + y2) / 2)
+tracker = MultiFaceTracker()
+submitted_at = 0
 
 
-def find_name(box, results):
-    cx, cy = box_center(box)
-
-    best_distance = float("inf")
-    best_name = "Searching..."
-
-    for old_box, name in results:
-        ox, oy = box_center(old_box)
-
-        distance = ((cx - ox) ** 2 + (cy - oy) ** 2) ** 0.5
-
-        if distance < best_distance:
-            best_distance = distance
-            best_name = name
-
-    # Хуучин байрлалаас хэт хол бол нэрийг ашиглахгүй
-    if best_distance > 80:
-        return "Searching..."
-
-    return best_name
-
-
-print("\nКамер ажиллаж байна. Q = гарах")
+print("\ncamera ajilllaj bn. Q = garah")
 
 try:
     while True:
         ret, frame = cap.read()
 
         if not ret:
-            print("Камерын дүрс авч чадсангүй!")
+            print("camera ii ndurs avj chadsngui!")
             break
 
         # MIRROR КАМЕР
@@ -188,27 +155,23 @@ try:
                 if x2 > x1 and y2 > y1:
                     faces.append((x1, y1, x2, y2))
 
-        # Дууссан танилтын үр дүнг авах
+        now = time.monotonic()
+        visible = tracker.update(faces, now)
         if future is not None and future.done():
             try:
-                last_results = future.result()
+                for name in tracker.apply(future.result(), submitted_at, now):
+                    print(f"Ene hun bol {name} yum baina. Q = garah")
             except Exception as e:
-                print("Таних ажиллагааны алдаа:", e)
-                last_results = []
-
+                print("tanih ajilgaany aldaa:", e)
             future = None
 
-        now = time.time()
-
-        # Өмнөх танилт дууссан үед дараагийнхыг эхлүүлэх
-        if (
-            faces
-            and future is None
-            and now - last_check >= INTERVAL
-        ):
+        if visible and future is None and now - last_check >= INTERVAL:
             face_items = []
 
-            for box in faces:
+            for person in visible:
+                if not person.needs_recognition(now):
+                    continue
+                box = person.box
                 x1, y1, x2, y2 = box
 
                 padding = int((x2 - x1) * 0.15)
@@ -221,22 +184,16 @@ try:
                 crop = frame[top:bottom, left:right].copy()
 
                 if crop.size > 0:
-                    face_items.append((box, crop))
+                    face_items.append((person.id, crop))
 
             if face_items:
                 future = executor.submit(recognize_all, face_items)
                 last_check = now
+                submitted_at = now
 
-        # Хүн бүрт тусдаа дөрвөлжин, нэр
-        for box in faces:
-            x1, y1, x2, y2 = box
-
-            name = find_name(box, last_results)
-
-            if name not in ("Unknown", "Searching..."):
-                color = (0, 255, 0)
-            else:
-                color = (0, 0, 255)
+        for person in visible:
+            x1, y1, x2, y2 = person.display_box
+            name, color = person.label()
 
             cv2.rectangle(
                 frame,
